@@ -29,7 +29,7 @@ jobs:
           MY_GITHUB_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
           OSU_CLIENT_ID: ${{ secrets.OSU_CLIENT_ID }}
           OSU_CLIENT_SECRET: ${{ secrets.OSU_CLIENT_SECRET }}
-        run: python parser.py
+        run: python -u parser.py
 
       - name: Save progress to atlas-all
         run: |
