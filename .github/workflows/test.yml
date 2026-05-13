@@ -1,0 +1,17 @@
+name: Secret Test
+on: workflow_dispatch
+
+jobs:
+  check-secret:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if secret exists
+        env:
+          TEST_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TEST_TOKEN" ]; then
+            echo "КРИТИЧЕСКАЯ ОШИБКА: Секрет пуст или не найден!"
+            exit 1
+          else
+            echo "УСПЕХ: Секрет обнаружен и загружен в среду выполнения."
+          fi
