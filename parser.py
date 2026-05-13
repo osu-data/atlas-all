@@ -50,11 +50,11 @@ def clone_repo(repo_name):
         os.system(f"git clone {url} > /dev/null 2>&1")
 
 def commit_and_push_all():
-    print("\n[*] Начинаю синхронизацию с репозиториями GitHub...")
+    print("\n[*] Repo sync...")
     
     with buffer_lock:
         for repo_name, files in data_buffer.items():
-            print(f"    -> Обработка репозитория: {repo_name}")
+            print(f"    -> Repo processing: {repo_name}")
             clone_repo(repo_name)
             
             for filename, new_entries in files.items():
@@ -69,7 +69,7 @@ def commit_and_push_all():
                                 current_list = json.loads(f"[{content}]")
                                 existing_hashes = {x['beatmap_sha256'] for x in current_list}
                     except Exception as e:
-                        print(f"       [!] Ошибка чтения {filename}: {e}")
+                        print(f"       [!] Read error {filename}: {e}")
 
                 unique_entries = [d for d in new_entries if d['beatmap_sha256'] not in existing_hashes]
                 
@@ -106,6 +106,7 @@ def get_hashes(file_path):
     except: return None
 
 def process_single_set(set_id, api_info):
+    print(f"    [D] Starting download: {set_id}...", flush=True)
     osz_name = f"temp_{set_id}.osz"
     extract_path = f"unpack_{set_id}"
     results = []
@@ -233,7 +234,7 @@ def main():
                                     full_queue[sid] = {'mode': m, 'file': fname, 'is_f': bset.get('is_featured_artist', False)}
                     except: continue
 
-    print(f"[*] All of this is ennded in {int(time.time() - start_time)}s. Unique beatmapsets: {len(full_queue)}")
+    print(f"[*] All of this is ended in {int(time.time() - start_time)}s. Unique beatmapsets: {len(full_queue)}")
 
     processed = set()
     if os.path.exists(PROGRESS_FILE):
@@ -241,12 +242,14 @@ def main():
 
     to_do = {k: v for k, v in full_queue.items() if k not in processed}
     print(f"[*] For processing (non-downloaded): {len(to_do)}")
-    
+
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
             if processed_counter >= GLOBAL_LIMIT: 
                 break
             executor.submit(thread_worker, sid, info)
+
+        executor.shutdown(wait=True)
 
     if data_buffer:
         commit_and_push_all()
