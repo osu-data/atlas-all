@@ -11,13 +11,12 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# === CONFIG ===
 CLIENT_ID = os.getenv("OSU_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OSU_CLIENT_SECRET")
 GH_TOKEN = os.getenv("MY_GITHUB_TOKEN")
 GH_USER = "osu-data"
 
-MAX_THREADS = 5 # Уменьшено для стабильности
+MAX_THREADS = 5 
 GLOBAL_LIMIT = 500
 
 REPO_MAP = {
@@ -27,7 +26,6 @@ REPO_MAP = {
     3: "atlas-mania"
 }
 ALL_DATA_REPO = "atlas-all"
-
 PROGRESS_FILE = "processed_sets.txt"
 
 session = requests.Session()
@@ -58,7 +56,7 @@ def commit_and_push_all():
     print("\n[*] Repo sync...")
     with buffer_lock:
         for repo_name, files in data_buffer.items():
-            print(f"    -> Repo precoessing: {repo_name}")
+            print(f"    -> Repo processing: {repo_name}")
             clone_repo(repo_name)
             for filename, new_entries in files.items():
                 file_path = os.path.join(repo_name, filename)
@@ -82,8 +80,11 @@ def commit_and_push_all():
                 cwd = os.getcwd()
                 os.chdir(repo_name)
                 os.system("git add .")
-                os.system(f'git commit -m "Update: {datetime.now().strftime("%Y-%m-%d %H:%M")}"')
-                os.system("git push")
+
+                if os.popen("git status --porcelain").read().strip():
+                    os.system(f'git commit -m "Update: {datetime.now().strftime("%Y-%m-%d %H:%M")} [skip ci]"')
+                    os.system("git pull --rebase -X ours origin main")
+                    os.system("git push origin main")
                 os.chdir(cwd)
 
 def get_osu_token():
