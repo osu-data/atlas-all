@@ -50,8 +50,8 @@ def clone_repo(repo_name):
         os.system(f"git clone {url}")
 
 def commit_and_push_all():
-    """GitHub push"""
-    print("\n[*] Add changes into repo...")
+    """Github push, in final"""
+    print("\n[*] Adding changes into repositories...")
     
     with buffer_lock:
         for repo_name, files in data_buffer.items():
@@ -78,11 +78,12 @@ def commit_and_push_all():
                             f.write(json.dumps(entry, ensure_ascii=False) + ",\n")
 
             cwd = os.getcwd()
-            os.chdir(repo_name)
-            os.system("git add .")
-            os.system(f'git commit -m "Update osu! data: {datetime.now().strftime("%Y-%m-%d %H:%M")}"')
-            os.system("git push")
-            os.chdir(cwd)
+            if os.path.exists(repo_name):
+                os.chdir(repo_name)
+                os.system("git add .")
+                os.system(f'git commit -m "Update osu! data: {datetime.now().strftime("%Y-%m-%d %H:%M")}"')
+                os.system("git push")
+                os.chdir(cwd)
 
 def get_osu_token():
     data = {'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'grant_type': 'client_credentials', 'scope': 'public'}
@@ -161,7 +162,6 @@ def process_single_set(set_id, api_info):
     return results
 
 def add_to_buffer(data, filename, mode):
-    """Add data in queue"""
     with buffer_lock:
         target_repos = [REPO_MAP[mode], ALL_DATA_REPO]
         for r_name in target_repos:
@@ -173,11 +173,18 @@ def add_to_buffer(data, filename, mode):
 
 def thread_worker(sid, info):
     global processed_counter
+
+    if processed_counter >= GLOBAL_LIMIT:
+        return
+
     try:
         data = process_single_set(sid, info)
         if data:
-            add_to_buffer(data, info['file'], info['mode'])
             with buffer_lock:
+                if processed_counter >= GLOBAL_LIMIT:
+                    return
+                
+                add_to_buffer(data, info['file'], info['mode'])
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
                 print(f"[OK] {sid} | Collected: {processed_counter}/{GLOBAL_LIMIT}")
@@ -187,13 +194,15 @@ def thread_worker(sid, info):
 def main():
     git_setup()
     token = get_osu_token()
-    if not token: return
+    if not token: 
+        print("[!] Failed to get osu! token.")
+        return
 
     modes = [0, 1, 2, 3]
     statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
     full_queue = {}
 
-    print("[*] osu!scan is working...")
+    print("[*] osu!scan is starting...")
     for m in modes:
         for s in statuses:
             for nsfw in [0, 1]:
@@ -221,13 +230,14 @@ def main():
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
-            if processed_counter >= GLOBAL_LIMIT: break
+            if processed_counter >= GLOBAL_LIMIT:
+                break
             executor.submit(thread_worker, sid, info)
 
     if data_buffer:
         commit_and_push_all()
     else:
-        print("[!] No new data.")
+        print("[!] No new data to commit.")
 
 if __name__ == "__main__":
     main()
