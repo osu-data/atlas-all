@@ -11,12 +11,13 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# === CONFIG ===
 CLIENT_ID = os.getenv("OSU_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OSU_CLIENT_SECRET")
 GH_TOKEN = os.getenv("MY_GITHUB_TOKEN")
 GH_USER = "osu-data"
 
-MAX_THREADS = 10
+MAX_THREADS = 5 # Уменьшено для стабильности
 GLOBAL_LIMIT = 500
 
 REPO_MAP = {
@@ -30,10 +31,14 @@ ALL_DATA_REPO = "atlas-all"
 PROGRESS_FILE = "processed_sets.txt"
 
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(pool_connections=MAX_THREADS, pool_maxsize=MAX_THREADS, max_retries=retries))
 
-MIRRORS = ["https://api.nerinyan.moe/d/{}", "https://beatconnect.io/b/{}/?novideo=1"]
+MIRRORS = [
+    "https://api.nerinyan.moe/d/{}", 
+    "https://beatconnect.io/b/{}/?novideo=1",
+    "https://kitsu.moe/d/{}"
+]
 HEADERS = {"User-Agent": "OsuDataArchiver/1.0"}
 
 data_buffer = {}
@@ -51,16 +56,13 @@ def clone_repo(repo_name):
 
 def commit_and_push_all():
     print("\n[*] Repo sync...")
-    
     with buffer_lock:
         for repo_name, files in data_buffer.items():
-            print(f"    -> Repo processing: {repo_name}")
+            print(f"    -> Repo precoessing: {repo_name}")
             clone_repo(repo_name)
-            
             for filename, new_entries in files.items():
                 file_path = os.path.join(repo_name, filename)
                 existing_hashes = set()
-
                 if os.path.exists(file_path):
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
@@ -68,11 +70,9 @@ def commit_and_push_all():
                             if content:
                                 current_list = json.loads(f"[{content}]")
                                 existing_hashes = {x['beatmap_sha256'] for x in current_list}
-                    except Exception as e:
-                        print(f"       [!] Read error {filename}: {e}")
+                    except: pass
 
                 unique_entries = [d for d in new_entries if d['beatmap_sha256'] not in existing_hashes]
-                
                 if unique_entries:
                     with open(file_path, 'a', encoding='utf-8') as f:
                         for entry in unique_entries:
@@ -82,19 +82,16 @@ def commit_and_push_all():
                 cwd = os.getcwd()
                 os.chdir(repo_name)
                 os.system("git add .")
-                os.system(f'git commit -m "Update osu! data: {datetime.now().strftime("%Y-%m-%d %H:%M")}"')
+                os.system(f'git commit -m "Update: {datetime.now().strftime("%Y-%m-%d %H:%M")}"')
                 os.system("git push")
                 os.chdir(cwd)
-                print(f"    [OK] DONE in {repo_name}")
 
 def get_osu_token():
     data = {'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'grant_type': 'client_credentials', 'scope': 'public'}
     try:
-        r = session.post('https://osu.ppy.sh/oauth/token', data=data, timeout=15)
+        r = session.post('https://osu.ppy.sh/oauth/token', data=data, timeout=10)
         return r.json().get('access_token')
-    except Exception as e:
-        print(f"[!] Auth error: {e}")
-        return None
+    except: return None
 
 def get_hashes(file_path):
     h_sha = hashlib.sha256()
@@ -106,7 +103,7 @@ def get_hashes(file_path):
     except: return None
 
 def process_single_set(set_id, api_info):
-    print(f"    [D] Starting download: {set_id}...", flush=True)
+    print(f"    [D] Task started: {set_id}", flush=True)
     osz_name = f"temp_{set_id}.osz"
     extract_path = f"unpack_{set_id}"
     results = []
@@ -114,7 +111,7 @@ def process_single_set(set_id, api_info):
     downloaded = False
     for mirror in MIRRORS:
         try:
-            r = session.get(mirror.format(set_id), headers=HEADERS, stream=True, timeout=25)
+            r = session.get(mirror.format(set_id), headers=HEADERS, stream=True, timeout=(10, 45))
             if r.status_code == 200:
                 with open(osz_name, 'wb') as f:
                     shutil.copyfileobj(r.raw, f)
@@ -125,6 +122,7 @@ def process_single_set(set_id, api_info):
 
     if not downloaded:
         if os.path.exists(osz_name): os.remove(osz_name)
+        print(f"    [!] Failed to download: {set_id}", flush=True)
         return None
 
     try:
@@ -140,7 +138,6 @@ def process_single_set(set_id, api_info):
                 ext = os.path.splitext(file)[1].lower()
                 h = get_hashes(fp)
                 if not h: continue
-                
                 if ext == '.mp4': res_hashes["video"].append(h)
                 elif ext in ['.png', '.jpg', '.jpeg']: res_hashes["bg"].append(h)
                 elif ext in ['.mp3', '.ogg']: res_hashes["audio"].append(h)
@@ -151,10 +148,9 @@ def process_single_set(set_id, api_info):
                 with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read(5000)
                     if f'Mode: {api_info["mode"]}' in content:
-                        sha_map = get_hashes(fp)
                         results.append({
                             "beatmapset_id": int(set_id),
-                            "beatmap_sha256": sha_map,
+                            "beatmap_sha256": get_hashes(fp),
                             "is_featured": api_info['is_f'],
                             "resources": res_hashes,
                             "checked_at": datetime.now().isoformat()
@@ -166,95 +162,67 @@ def process_single_set(set_id, api_info):
 
     return results
 
-def add_to_buffer(data, filename, mode):
-    with buffer_lock:
-        target_repos = [REPO_MAP[mode], ALL_DATA_REPO]
-        for r_name in target_repos:
-            if r_name not in data_buffer:
-                data_buffer[r_name] = {}
-            if filename not in data_buffer[r_name]:
-                data_buffer[r_name][filename] = []
-            data_buffer[r_name][filename].extend(data)
-
 def thread_worker(sid, info):
     global processed_counter
-
-    if processed_counter >= GLOBAL_LIMIT:
-        return
-
+    if processed_counter >= GLOBAL_LIMIT: return
     try:
         data = process_single_set(sid, info)
         if data:
             with buffer_lock:
-                if processed_counter >= GLOBAL_LIMIT:
-                    return
-                
+                if processed_counter >= GLOBAL_LIMIT: return
                 add_to_buffer(data, info['file'], info['mode'])
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
-                print(f"[OK] {sid} | Collected: {processed_counter}/{GLOBAL_LIMIT}", flush=True)
+                print(f"[OK] {sid} | Done: {processed_counter}/{GLOBAL_LIMIT}", flush=True)
     except Exception as e:
         print(f"[ERR] {sid}: {e}", flush=True)
 
+def add_to_buffer(data, filename, mode):
+    target_repos = [REPO_MAP[mode], ALL_DATA_REPO]
+    for r_name in target_repos:
+        if r_name not in data_buffer: data_buffer[r_name] = {}
+        if filename not in data_buffer[r_name]: data_buffer[r_name][filename] = []
+        data_buffer[r_name][filename].extend(data)
+
 def main():
     git_setup()
-    
-    print("[*] think about token...", flush=True)
+    print("[*] Auth check...", flush=True)
     token = get_osu_token()
-    if not token: 
-        print("[!] no token...")
-        return
-    print("[+] yes token!", flush=True)
-
+    if not token: return
+    
+    full_queue = {}
+    print("[*] Scanning API...", flush=True)
     modes = [0, 1, 2, 3]
     statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
-    full_queue = {}
-
-    print("[*] Deep API scan (224 combo)...", flush=True)
-    start_time = time.time()
     
     for m in modes:
         for s in statuses:
-            print(f"    -> Scanning Mode: {m}, Status: {s}...", flush=True)
             for nsfw in [0, 1]:
-                for extra in [[], ['video'], ['storyboard'], ['video', 'storyboard']]:
-                    extra_tag = 'v_s' if len(extra)==2 else (extra[0] if extra else 'none')
-                    fname = f"m{m}_{s}_nsfw{nsfw}_{extra_tag}.json"
-                    
-                    params = {'m': m, 's': s, 'nsfw': nsfw}
-                    for e in extra: params['extra[]'] = e
-                    
-                    try:
-                        r = session.get("https://osu.ppy.sh/api/v2/beatmapsets/search", 
-                                        params=params, headers={'Authorization': f'Bearer {token}'}, timeout=15)
-                        if r.status_code == 200:
-                            for bset in r.json().get('beatmapsets', []):
-                                sid = str(bset['id'])
-                                if sid not in full_queue:
-                                    full_queue[sid] = {'mode': m, 'file': fname, 'is_f': bset.get('is_featured_artist', False)}
-                    except: continue
-
-    print(f"[*] All of this is ended in {int(time.time() - start_time)}s. Unique beatmapsets: {len(full_queue)}")
+                params = {'m': m, 's': s, 'nsfw': nsfw}
+                try:
+                    r = session.get("https://osu.ppy.sh/api/v2/beatmapsets/search", 
+                                    params=params, headers={'Authorization': f'Bearer {token}'}, timeout=15)
+                    if r.status_code == 200:
+                        for bset in r.json().get('beatmapsets', []):
+                            sid = str(bset['id'])
+                            if sid not in full_queue:
+                                full_queue[sid] = {'mode': m, 'file': f"m{m}_{s}.json", 'is_f': bset.get('is_featured_artist', False)}
+                except: continue
 
     processed = set()
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r') as f: processed = {l.strip() for l in f}
 
     to_do = {k: v for k, v in full_queue.items() if k not in processed}
-    print(f"[*] For processing (non-downloaded): {len(to_do)}")
+    print(f"[*] Total to process: {len(to_do)}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
-            if processed_counter >= GLOBAL_LIMIT: 
-                break
+            if processed_counter >= GLOBAL_LIMIT: break
             executor.submit(thread_worker, sid, info)
-
-        executor.shutdown(wait=True)
-
+    
     if data_buffer:
         commit_and_push_all()
-    else:
-        print("[!] No more data.")
 
 if __name__ == "__main__":
     main()
