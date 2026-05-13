@@ -1,6 +1,11 @@
 name: Osu Data Auto-Sync
+
 on:
   workflow_dispatch:
+
+concurrency:
+  group: osu-archiver
+  cancel-in-progress: false
 
 jobs:
   update-data:
@@ -13,6 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.MY_GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,5 +42,8 @@ jobs:
           git config --global user.name "kiroffYT"
           git config --global user.email "kirhit135@gmail.com"
           git add processed_sets.txt
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update progress [skip ci]"
-          git push
+          if ! git diff --quiet --staged; then
+            git commit -m "Update progress [skip ci]"
+            git pull --rebase -X ours origin main
+            git push origin main
+          fi
