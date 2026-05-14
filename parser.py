@@ -204,15 +204,23 @@ def process_single_set(set_id, api_info):
 
 def thread_worker(sid, info, total_to_do):
     global processed_counter
+
+    if processed_counter >= GLOBAL_LIMIT:
+        return
+
     try:
         data = process_single_set(sid, info)
         if data:
             with buffer_lock:
+                if processed_counter >= GLOBAL_LIMIT:
+                    return
+                
                 target_repos = [REPO_MAP[info['mode']], ALL_DATA_REPO]
                 for r_name in target_repos:
                     if r_name not in data_buffer: data_buffer[r_name] = {}
                     if info['file'] not in data_buffer[r_name]: data_buffer[r_name][info['file']] = []
                     data_buffer[r_name][info['file']].extend(data)
+                
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
                 print(f"[{processed_counter}/{GLOBAL_LIMIT}] OK: {sid} (In queue: {total_to_do - processed_counter})", flush=True)
@@ -250,7 +258,6 @@ def main():
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
             if processed_counter >= GLOBAL_LIMIT: 
-                print(f"\n[!] Reached limit ({GLOBAL_LIMIT}). Finalizing...")
                 break
             executor.submit(thread_worker, sid, info, total_new)
     
