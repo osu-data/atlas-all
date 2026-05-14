@@ -18,21 +18,27 @@ GH_TOKEN = os.getenv("MY_GITHUB_TOKEN")
 GH_USER = "osu-data"
 
 MAX_THREADS = 5 
-GLOBAL_LIMIT = 1000 
+GLOBAL_LIMIT = 3000 
+MAX_PAGES_PER_CATEGORY = 100
+RETRY_THRESHOLD = 10 # Download retry limit
 
 REPO_MAP = {0: "atlas-circles", 1: "atlas-taiko", 2: "atlas-catch", 3: "atlas-mania"}
 ALL_DATA_REPO = "atlas-all"
 PROGRESS_FILE = "processed_sets.txt"
+FAILED_LOG = "failed_attempts.json"
+QUARANTINE_FILE = "permanent_failures.txt"
 
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries))
 
 MIRRORS = ["https://api.nerinyan.moe/d/{}", "https://beatconnect.io/b/{}/?novideo=1", "https://kitsu.moe/d/{}"]
-HEADERS = {"User-Agent": "OsuDataArchiver/1.0"}
+HEADERS = {"User-Agent": "OsuDataArchiver/1.1"}
 
 data_buffer = {}
-full_queue = {}
+full_queue = {} 
+processed_cache = set()
+failed_attempts = {}
 buffer_lock = threading.Lock()
 processed_counter = 0
 
@@ -45,8 +51,21 @@ def clone_repo(repo_name):
         url = f"https://{GH_TOKEN}@github.com/{GH_USER}/{repo_name}.git"
         os.system(f"git clone {url} > /dev/null 2>&1")
 
+def load_failed_data():
+    global failed_attempts
+    if os.path.exists(FAILED_LOG):
+        try:
+            with open(FAILED_LOG, 'r') as f: failed_attempts = json.load(f)
+        except: failed_attempts = {}
+
+def save_failed_data():
+    with buffer_lock:
+        with open(FAILED_LOG, 'w') as f:
+            json.dump(failed_attempts, f, indent=4)
+
 def commit_and_push_all():
     print(f"\n[*] [{datetime.now().strftime('%H:%M:%S')}] Syncing to GitHub...")
+    save_failed_data()
     with buffer_lock:
         for repo_name, files in data_buffer.items():
             clone_repo(repo_name)
@@ -66,6 +85,7 @@ def commit_and_push_all():
                     with open(file_path, 'a', encoding='utf-8') as f:
                         for entry in unique_entries:
                             f.write(json.dumps(entry, ensure_ascii=False) + ",\n")
+            
             if os.path.exists(repo_name):
                 cwd = os.getcwd()
                 os.chdir(repo_name)
@@ -92,33 +112,27 @@ def get_hashes(file_path):
     except: return None
 
 def fetch_api_worker(m, s, token):
-    """Worker for API"""
     headers = {'Authorization': f'Bearer {token}'}
     local_count = 0
     for nsfw in [0, 1]:
         cursor = None
         page = 1
-        while True:
-            params = {'m': m, 's': s, 'nsfw': nsfw, 'cursor_string': cursor}
+        while page <= MAX_PAGES_PER_CATEGORY:
+            params = {'m': m, 's': s, 'nsfw': nsfw, 'cursor_string': cursor, 'sort': 'id_asc'}
             try:
                 r = session.get("https://osu.ppy.sh/api/v2/beatmapsets/search", params=params, headers=headers, timeout=15)
                 if r.status_code != 200: break
                 data = r.json()
                 bsets = data.get('beatmapsets', [])
                 if not bsets: break
-                
                 with buffer_lock:
                     for bset in bsets:
                         sid = str(bset['id'])
                         if sid not in full_queue:
                             full_queue[sid] = {'mode': m, 'file': f"m{m}_{s}.json", 'is_f': bset.get('is_featured_artist', False)}
-                            local_count += 1
-                
+                            if sid not in processed_cache: local_count += 1
                 cursor = data.get('cursor_string')
                 if not cursor: break
-                # Лог каждые 10 страниц, чтобы не спамить
-                if page % 10 == 0:
-                    print(f"    [Scanner] Mode {m} | {s} | NSFW:{nsfw} | Page {page}...", flush=True)
                 page += 1
                 time.sleep(0.05)
             except: break
@@ -129,6 +143,7 @@ def process_single_set(set_id, api_info):
     extract_path = f"unpack_{set_id}"
     results = []
     downloaded = False
+    
     for mirror in MIRRORS:
         try:
             r = session.get(mirror.format(set_id), headers=HEADERS, stream=True, timeout=(10, 45))
@@ -137,9 +152,17 @@ def process_single_set(set_id, api_info):
                 if zipfile.is_zipfile(osz_name):
                     downloaded = True; break
         except: continue
+
     if not downloaded:
         if os.path.exists(osz_name): os.remove(osz_name)
+        # Error counter
+        with buffer_lock:
+            failed_attempts[set_id] = failed_attempts.get(set_id, 0) + 1
+            if failed_attempts[set_id] >= RETRY_THRESHOLD:
+                with open(QUARANTINE_FILE, 'a') as f: f.write(f"{set_id}\n")
+                if set_id in failed_attempts: del failed_attempts[set_id]
         return None
+
     try:
         with zipfile.ZipFile(osz_name, 'r') as zip_ref: zip_ref.extractall(extract_path)
         res_hashes = {"bg": [], "audio": [], "video": []}
@@ -168,6 +191,9 @@ def process_single_set(set_id, api_info):
                             "resources": res_hashes, "checked_at": datetime.now().isoformat()
                         })
             except: continue
+        # Yes download = no defect
+        with buffer_lock:
+            if set_id in failed_attempts: del failed_attempts[set_id]
     finally:
         if os.path.exists(osz_name): os.remove(osz_name)
         if os.path.exists(extract_path): shutil.rmtree(extract_path, ignore_errors=True)
@@ -186,37 +212,42 @@ def thread_worker(sid, info, total_to_do):
                     data_buffer[r_name][info['file']].extend(data)
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
-                print(f"[{processed_counter}/{GLOBAL_LIMIT}] OK: {sid} (Left: {total_to_do - processed_counter})", flush=True)
+                print(f"[{processed_counter}/{GLOBAL_LIMIT}] OK: {sid}", flush=True)
     except Exception as e: print(f"[!] Error {sid}: {e}", flush=True)
 
 def main():
+    global processed_cache
     git_setup()
+    load_failed_data()
+    
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as f: processed_cache = {l.strip() for l in f}
+    
+    quarantine = set()
+    if os.path.exists(QUARANTINE_FILE):
+        with open(QUARANTINE_FILE, 'r') as f: quarantine = {l.strip() for l in f}
+
     token = get_osu_token()
     if not token: return
     
-    print("[*] Starting Parallel Deep Scan...", flush=True)
-    modes = [0, 1, 2, 3]
-    statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
+    print(f"[*] Parallel Scan... (Cache: {len(processed_cache)}, Quarantine: {len(quarantine)})", flush=True)
+    modes = [0, 1, 2, 3]; statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
     
     with ThreadPoolExecutor(max_workers=8) as search_executor:
         futures = [search_executor.submit(fetch_api_worker, m, s, token) for m in modes for s in statuses]
-        for future in as_completed(futures): pass # Ждем завершения всех
+        for future in as_completed(futures): pass
 
-    print(f"\n[*] Scan complete. Found: {len(full_queue)}")
-    processed = set()
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r') as f: processed = {l.strip() for l in f}
-
-    to_do = {k: v for k, v in full_queue.items() if k not in processed}
-    print(f"[*] New for download: {len(to_do)}\n" + "-"*30)
-
+    # Queue filter
+    to_do = {k: v for k, v in full_queue.items() if k not in processed_cache and k not in quarantine}
+    
+    print(f"[*] Found {len(to_do)} NEW maps.")
+    
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
             if processed_counter >= GLOBAL_LIMIT: break
             executor.submit(thread_worker, sid, info, len(to_do))
     
-    if data_buffer: commit_and_push_all()
-    print(f"[*] Finished. Saved {processed_counter} sets.")
+    if data_buffer or failed_attempts: commit_and_push_all()
 
 if __name__ == "__main__":
     main()
