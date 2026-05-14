@@ -11,13 +11,14 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# === CONFIG ===
 CLIENT_ID = os.getenv("OSU_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OSU_CLIENT_SECRET")
 GH_TOKEN = os.getenv("MY_GITHUB_TOKEN")
 GH_USER = "osu-data"
 
 MAX_THREADS = 5 
-GLOBAL_LIMIT = 500
+GLOBAL_LIMIT = 1000 
 
 REPO_MAP = {
     0: "atlas-circles",
@@ -80,7 +81,6 @@ def commit_and_push_all():
                 cwd = os.getcwd()
                 os.chdir(repo_name)
                 os.system("git add .")
-
                 if os.popen("git status --porcelain").read().strip():
                     os.system(f'git commit -m "Update: {datetime.now().strftime("%Y-%m-%d %H:%M")} [skip ci]"')
                     os.system("git pull --rebase -X ours origin main")
@@ -123,7 +123,6 @@ def process_single_set(set_id, api_info):
 
     if not downloaded:
         if os.path.exists(osz_name): os.remove(osz_name)
-        print(f"    [!] Failed to download: {set_id}", flush=True)
         return None
 
     try:
@@ -146,11 +145,22 @@ def process_single_set(set_id, api_info):
 
         for fp in osu_files:
             try:
+                b_id = 0
                 with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(5000)
-                    if f'Mode: {api_info["mode"]}' in content:
+                    lines = f.readlines()
+                    content_head = "".join(lines[:100])
+                    
+                    if f'Mode: {api_info["mode"]}' in content_head:
+                        for line in lines:
+                            if line.startswith("BeatmapID:"):
+                                try:
+                                    b_id = int(line.split(":")[1].strip())
+                                    break
+                                except: pass
+                        
                         results.append({
                             "beatmapset_id": int(set_id),
+                            "beatmap_id": b_id,
                             "beatmap_sha256": get_hashes(fp),
                             "is_featured": api_info['is_f'],
                             "resources": res_hashes,
@@ -165,16 +175,14 @@ def process_single_set(set_id, api_info):
 
 def thread_worker(sid, info):
     global processed_counter
-    if processed_counter >= GLOBAL_LIMIT: return
     try:
         data = process_single_set(sid, info)
         if data:
             with buffer_lock:
-                if processed_counter >= GLOBAL_LIMIT: return
                 add_to_buffer(data, info['file'], info['mode'])
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
-                print(f"[OK] {sid} | Done: {processed_counter}/{GLOBAL_LIMIT}", flush=True)
+                print(f"[OK] {sid} | Done: {processed_counter}", flush=True)
     except Exception as e:
         print(f"[ERR] {sid}: {e}", flush=True)
 
@@ -187,35 +195,45 @@ def add_to_buffer(data, filename, mode):
 
 def main():
     git_setup()
-    print("[*] Auth check...", flush=True)
     token = get_osu_token()
     if not token: return
     
     full_queue = {}
-    print("[*] Scanning API...", flush=True)
+    print("[*] Deep Scanning osu! API...", flush=True)
     modes = [0, 1, 2, 3]
     statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
+    headers = {'Authorization': f'Bearer {token}'}
     
     for m in modes:
         for s in statuses:
             for nsfw in [0, 1]:
-                params = {'m': m, 's': s, 'nsfw': nsfw}
-                try:
-                    r = session.get("https://osu.ppy.sh/api/v2/beatmapsets/search", 
-                                    params=params, headers={'Authorization': f'Bearer {token}'}, timeout=15)
-                    if r.status_code == 200:
-                        for bset in r.json().get('beatmapsets', []):
+                cursor = None
+                while True:
+                    params = {'m': m, 's': s, 'nsfw': nsfw, 'cursor_string': cursor}
+                    try:
+                        r = session.get("https://osu.ppy.sh/api/v2/beatmapsets/search", 
+                                        params=params, headers=headers, timeout=15)
+                        if r.status_code != 200: break
+                        data = r.json()
+                        bsets = data.get('beatmapsets', [])
+                        if not bsets: break
+                        
+                        for bset in bsets:
                             sid = str(bset['id'])
                             if sid not in full_queue:
                                 full_queue[sid] = {'mode': m, 'file': f"m{m}_{s}.json", 'is_f': bset.get('is_featured_artist', False)}
-                except: continue
+                        
+                        cursor = data.get('cursor_string')
+                        if not cursor: break
+                        time.sleep(0.2)
+                    except: break
 
     processed = set()
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r') as f: processed = {l.strip() for l in f}
 
     to_do = {k: v for k, v in full_queue.items() if k not in processed}
-    print(f"[*] Total to process: {len(to_do)}", flush=True)
+    print(f"[*] Found {len(full_queue)} sets. To do: {len(to_do)}", flush=True)
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
