@@ -18,9 +18,9 @@ GH_TOKEN = os.getenv("MY_GITHUB_TOKEN")
 GH_USER = "osu-data"
 
 MAX_THREADS = 5 
-GLOBAL_LIMIT = 3000 
+GLOBAL_LIMIT = 500 
 MAX_PAGES_PER_CATEGORY = 100
-RETRY_THRESHOLD = 10 # Download retry limit
+RETRY_THRESHOLD = 10 
 
 REPO_MAP = {0: "atlas-circles", 1: "atlas-taiko", 2: "atlas-catch", 3: "atlas-mania"}
 ALL_DATA_REPO = "atlas-all"
@@ -64,10 +64,11 @@ def save_failed_data():
             json.dump(failed_attempts, f, indent=4)
 
 def commit_and_push_all():
-    print(f"\n[*] [{datetime.now().strftime('%H:%M:%S')}] Syncing to GitHub...")
+    print(f"\n[*] [{datetime.now().strftime('%H:%M:%S')}] Syncing all data to GitHub...")
     save_failed_data()
     with buffer_lock:
         for repo_name, files in data_buffer.items():
+            print(f"    -> Syncing repo: {repo_name}")
             clone_repo(repo_name)
             for filename, new_entries in files.items():
                 file_path = os.path.join(repo_name, filename)
@@ -133,6 +134,8 @@ def fetch_api_worker(m, s, token):
                             if sid not in processed_cache: local_count += 1
                 cursor = data.get('cursor_string')
                 if not cursor: break
+                if page % 25 == 0:
+                    print(f"    [Scanner] Mode {m} | Status {s} | Page {page} | Found {local_count} new so far", flush=True)
                 page += 1
                 time.sleep(0.05)
             except: break
@@ -155,10 +158,10 @@ def process_single_set(set_id, api_info):
 
     if not downloaded:
         if os.path.exists(osz_name): os.remove(osz_name)
-        # Error counter
         with buffer_lock:
             failed_attempts[set_id] = failed_attempts.get(set_id, 0) + 1
             if failed_attempts[set_id] >= RETRY_THRESHOLD:
+                print(f"    [!] {set_id} reached error limit ({RETRY_THRESHOLD}). Quarantined.")
                 with open(QUARANTINE_FILE, 'a') as f: f.write(f"{set_id}\n")
                 if set_id in failed_attempts: del failed_attempts[set_id]
         return None
@@ -175,6 +178,7 @@ def process_single_set(set_id, api_info):
                 elif ext in ['.png', '.jpg', '.jpeg']: res_hashes["bg"].append(h)
                 elif ext in ['.mp3', '.ogg']: res_hashes["audio"].append(h)
                 elif ext == '.osu': osu_files.append(fp)
+        
         for fp in osu_files:
             try:
                 b_id = 0
@@ -191,7 +195,6 @@ def process_single_set(set_id, api_info):
                             "resources": res_hashes, "checked_at": datetime.now().isoformat()
                         })
             except: continue
-        # Yes download = no defect
         with buffer_lock:
             if set_id in failed_attempts: del failed_attempts[set_id]
     finally:
@@ -212,8 +215,8 @@ def thread_worker(sid, info, total_to_do):
                     data_buffer[r_name][info['file']].extend(data)
                 with open(PROGRESS_FILE, 'a') as f: f.write(f"{sid}\n")
                 processed_counter += 1
-                print(f"[{processed_counter}/{GLOBAL_LIMIT}] OK: {sid}", flush=True)
-    except Exception as e: print(f"[!] Error {sid}: {e}", flush=True)
+                print(f"[{processed_counter}/{GLOBAL_LIMIT}] OK: {sid} (In queue: {total_to_do - processed_counter})", flush=True)
+    except Exception as e: print(f"[!] Critical Error on {sid}: {e}", flush=True)
 
 def main():
     global processed_cache
@@ -228,26 +231,35 @@ def main():
         with open(QUARANTINE_FILE, 'r') as f: quarantine = {l.strip() for l in f}
 
     token = get_osu_token()
-    if not token: return
+    if not token: 
+        print("[!!!] Auth failed. Check secrets."); return
     
-    print(f"[*] Parallel Scan... (Cache: {len(processed_cache)}, Quarantine: {len(quarantine)})", flush=True)
+    print(f"[*] Starting Parallel Scan (Cache: {len(processed_cache)}, Quarantine: {len(quarantine)})...", flush=True)
     modes = [0, 1, 2, 3]; statuses = ['ranked', 'approved', 'qualified', 'loved', 'pending', 'wip', 'graveyard']
     
     with ThreadPoolExecutor(max_workers=8) as search_executor:
         futures = [search_executor.submit(fetch_api_worker, m, s, token) for m in modes for s in statuses]
         for future in as_completed(futures): pass
 
-    # Queue filter
     to_do = {k: v for k, v in full_queue.items() if k not in processed_cache and k not in quarantine}
+    total_new = len(to_do)
     
-    print(f"[*] Found {len(to_do)} NEW maps.")
+    print(f"\n[*] Scan complete. Found {total_new} items to download.")
+    print(f"[*] Processing limit for this session: {GLOBAL_LIMIT}\n" + "-"*40)
     
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         for sid, info in to_do.items():
-            if processed_counter >= GLOBAL_LIMIT: break
-            executor.submit(thread_worker, sid, info, len(to_do))
+            if processed_counter >= GLOBAL_LIMIT: 
+                print(f"\n[!] Reached limit ({GLOBAL_LIMIT}). Finalizing...")
+                break
+            executor.submit(thread_worker, sid, info, total_new)
     
-    if data_buffer or failed_attempts: commit_and_push_all()
+    if data_buffer or failed_attempts:
+        commit_and_push_all()
+    else:
+        print("[*] Nothing new to save.")
+    
+    print(f"[*] Session finished. Processed {processed_counter} maps.")
 
 if __name__ == "__main__":
     main()
