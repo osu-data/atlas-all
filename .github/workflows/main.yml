@@ -2,6 +2,11 @@ name: Osu Data Auto-Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      run_count:
+        description: 'Runs count'
+        required: true
+        default: '3'
 
 concurrency:
   group: osu-archiver
@@ -46,4 +51,25 @@ jobs:
             git commit -m "Update progress [skip ci]"
             git pull --rebase -X ours origin main
             git push origin main
+          fi
+
+      - name: Trigger next run if needed
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_ID: "main.yml" 
+          CURRENT_COUNT: ${{ github.event.inputs.run_count }}
+        run: |
+          NEXT_COUNT=$((CURRENT_COUNT - 1))
+          echo "Run count: $CURRENT_COUNT / $NEXT_COUNT"
+          
+          if [ "$NEXT_COUNT" -gt 0 ]; then
+            echo "[*] Another cycle starts..."
+            curl -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/dispatches \
+              -d "{\"ref\":\"main\", \"inputs\": {\"run_count\": \"$NEXT_COUNT\"}}"
+          else
+            echo "[*] Run count is ended. And parsing (for this session) too."
           fi
